@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Archive Viewer</title>
+  <script src="https://cdn.jsdelivr.net/npm/replaywebpage@2/ui.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; font-family: system-ui, -apple-system, sans-serif; }
+    body {
+      display: flex;
+      flex-direction: column;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    header {
+      padding: 1rem 2rem;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    header h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    header p {
+      font-size: 0.875rem;
+      color: #94a3b8;
+      margin-top: 0.25rem;
+    }
+    replay-web-page {
+      flex: 1;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Web Archive Viewer</h1>
+    <p>WACZ replay powered by ReplayWeb.page — interactive "Wayback Machine" experience</p>
+  </header>
+
+  <replay-web-page
+    source="data/capture.wacz"
+    replayBase="https://cdn.jsdelivr.net/npm/replaywebpage@2/"
+  ></replay-web-page>
+</body>
+</html>

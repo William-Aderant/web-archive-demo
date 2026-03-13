@@ -1,0 +1,6 @@
+playwright
+wacz
+har2warc
+python-dotenv
+setuptools
+flask

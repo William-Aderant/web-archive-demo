@@ -1,18 +1,18 @@
 """
 Flask web server that replays a WARC archive in a browser viewer.
 
-Parses data/capture.warc.gz at startup, builds an in-memory index keyed by
-URL path+query, and serves archived resources at their original paths.
-The viewer page lives at /_viewer to stay out of the way.
+Supports both single-page and multi-page (batch) WARC files. When multiple
+HTML pages are present, the viewer shows a sidebar to switch between them.
 """
 
+import argparse
 import gzip as gzip_mod
 import logging
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, Response, abort, jsonify, request as flask_request
+from flask import Flask, Response, abort, jsonify, redirect, request as flask_request
 from warcio.archiveiterator import ArchiveIterator
 
 logging.basicConfig(
@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-WARC_PATH = Path("data/capture.warc.gz")
+DEFAULT_WARC = Path("data/capture.warc.gz")
 
 app = Flask(__name__)
 
@@ -34,6 +34,7 @@ class WarcIndex:
     def __init__(self, warc_path: Path):
         self.entries: dict[str, dict] = {}
         self.path_index: dict[str, dict] = {}
+        self.pages: list[dict] = []
         self.first_url: str = ""
         self.first_path: str = ""
         self.origin: str = ""
@@ -42,7 +43,9 @@ class WarcIndex:
         self._load(warc_path)
 
     def _load(self, warc_path: Path) -> None:
+        seen_html_paths: set[str] = set()
         count = 0
+
         with open(warc_path, "rb") as fh:
             for record in ArchiveIterator(fh):
                 if record.rec_type != "response":
@@ -96,27 +99,58 @@ class WarcIndex:
                 if parsed.query:
                     path_key += "?" + parsed.query
 
+                warc_date = record.rec_headers.get_header("WARC-Date") or ""
+
                 record_data = {
                     "status": status,
                     "headers": headers,
                     "body": body,
                     "mime": mime,
                     "url": url,
+                    "warc_date": warc_date,
                 }
 
                 self.entries[url] = record_data
                 self.path_index[path_key] = record_data
 
+                is_page = (
+                    "text/html" in mime
+                    and status == 200
+                    and path_key not in seen_html_paths
+                )
+                if is_page:
+                    seen_html_paths.add(path_key)
+                    title = ""
+                    if body:
+                        import re
+                        m = re.search(
+                            rb"<title[^>]*>(.*?)</title>",
+                            body, re.IGNORECASE | re.DOTALL,
+                        )
+                        if m:
+                            title = m.group(1).decode("utf-8", errors="replace").strip()
+
+                    self.pages.append({
+                        "url": url,
+                        "path": path_key,
+                        "title": title or url,
+                        "origin": f"{parsed.scheme}://{parsed.netloc}",
+                        "date": warc_date,
+                        "size": len(body),
+                    })
+
                 if count == 0:
                     self.first_url = url
                     self.first_path = parsed.path
                     self.origin = f"{parsed.scheme}://{parsed.netloc}"
-                    warc_date = record.rec_headers.get_header("WARC-Date") or ""
                     self.capture_ts = warc_date
 
                 count += 1
 
-        log.info("Loaded %d response(s) from %s", count, warc_path)
+        log.info(
+            "Loaded %d response(s), %d page(s) from %s",
+            count, len(self.pages), warc_path,
+        )
 
 
 warc_index: WarcIndex | None = None
@@ -125,7 +159,7 @@ warc_index: WarcIndex | None = None
 def get_index() -> WarcIndex:
     global warc_index
     if warc_index is None:
-        warc_index = WarcIndex(WARC_PATH)
+        warc_index = WarcIndex(DEFAULT_WARC)
     return warc_index
 
 
@@ -135,20 +169,51 @@ def get_index() -> WarcIndex:
 def viewer():
     idx = get_index()
 
+    page_idx = flask_request.args.get("page", "0")
+    try:
+        page_num = int(page_idx)
+    except ValueError:
+        page_num = 0
+    page_num = max(0, min(page_num, len(idx.pages) - 1))
+
+    current = idx.pages[page_num] if idx.pages else {
+        "url": idx.first_url, "path": idx.first_path,
+        "title": idx.first_url, "origin": idx.origin,
+        "date": idx.capture_ts, "size": 0,
+    }
+
     capture_date = ""
-    if idx.capture_ts:
+    if current.get("date"):
         try:
-            dt = datetime.fromisoformat(idx.capture_ts.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(current["date"].replace("Z", "+00:00"))
             capture_date = dt.strftime("%b %d, %Y at %H:%M:%S UTC")
         except ValueError:
-            capture_date = idx.capture_ts
+            capture_date = current["date"]
+
+    pages_html = ""
+    for i, pg in enumerate(idx.pages):
+        active = "active" if i == page_num else ""
+        label = pg["title"][:55] + ("..." if len(pg["title"]) > 55 else "")
+        domain = urlparse(pg["url"]).netloc
+        pages_html += (
+            f'<a class="page-item {active}" href="/_viewer?page={i}">'
+            f'<span class="page-title">{label}</span>'
+            f'<span class="page-domain">{domain}</span>'
+            f'</a>\n'
+        )
+
+    multi = len(idx.pages) > 1
 
     return VIEWER_HTML.format(
-        archived_url=idx.first_url,
-        first_path=idx.first_path,
+        archived_url=current["url"],
+        first_path=current["path"],
         capture_date=capture_date,
         resource_count=len(idx.entries),
+        page_count=len(idx.pages),
         total_kb=idx.total_size // 1024,
+        pages_html=pages_html,
+        sidebar_class="has-sidebar" if multi else "",
+        current_origin=current.get("origin", idx.origin),
     )
 
 
@@ -166,18 +231,19 @@ def serve_archived(path: str):
     entry = idx.path_index.get(lookup)
     if not entry:
         if not path:
-            return viewer()
+            return redirect("/_viewer")
         log.warning("[MISS] %s", lookup)
         abort(404)
 
     body = entry["body"]
     mime = entry["mime"]
 
+    origin = urlparse(entry["url"]).scheme + "://" + urlparse(entry["url"]).netloc
     rewritable = ("text/html", "text/css", "application/javascript",
                   "text/javascript")
     if any(t in mime for t in rewritable) and body:
         text = body.decode("utf-8", errors="replace")
-        text = text.replace(idx.origin, "")
+        text = text.replace(origin, "")
         body = text.encode("utf-8")
 
     log.info("[SERVE] %s (%d bytes)", entry["url"], len(body))
@@ -201,7 +267,9 @@ def meta():
         "origin": idx.origin,
         "capture_ts": idx.capture_ts,
         "resource_count": len(idx.entries),
+        "page_count": len(idx.pages),
         "total_bytes": idx.total_size,
+        "pages": idx.pages,
     })
 
 
@@ -231,6 +299,7 @@ VIEWER_HTML = """<!DOCTYPE html>
       background: #1e293b;
       border-bottom: 1px solid #334155;
       flex-shrink: 0;
+      z-index: 10;
     }}
     .badge {{
       display: inline-flex;
@@ -299,6 +368,64 @@ VIEWER_HTML = """<!DOCTYPE html>
       gap: 4px;
     }}
 
+    .main {{
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }}
+
+    .sidebar {{
+      display: none;
+      width: 280px;
+      background: #1e293b;
+      border-right: 1px solid #334155;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }}
+    .has-sidebar .sidebar {{ display: flex; flex-direction: column; }}
+
+    .sidebar-header {{
+      padding: 12px 16px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+      border-bottom: 1px solid #334155;
+      flex-shrink: 0;
+    }}
+    .sidebar-list {{
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 0;
+    }}
+
+    .page-item {{
+      display: block;
+      padding: 10px 16px;
+      text-decoration: none;
+      color: #cbd5e1;
+      border-left: 3px solid transparent;
+      transition: background 0.15s;
+    }}
+    .page-item:hover {{ background: #334155; }}
+    .page-item.active {{
+      background: #0f172a;
+      border-left-color: #60a5fa;
+      color: #fff;
+    }}
+    .page-title {{
+      display: block;
+      font-size: 13px;
+      line-height: 1.3;
+      margin-bottom: 2px;
+    }}
+    .page-domain {{
+      display: block;
+      font-size: 11px;
+      color: #64748b;
+    }}
+
     .viewer-frame {{
       flex: 1;
       border: none;
@@ -306,7 +433,7 @@ VIEWER_HTML = """<!DOCTYPE html>
     }}
   </style>
 </head>
-<body>
+<body class="{sidebar_class}">
   <div class="toolbar">
     <div class="badge"><span class="dot"></span> WARC Replay</div>
     <div class="url-bar">
@@ -315,11 +442,20 @@ VIEWER_HTML = """<!DOCTYPE html>
     </div>
     <div class="meta">
       <span>{capture_date}</span>
+      <span>{page_count} pages</span>
       <span>{resource_count} resources</span>
       <span>{total_kb} KB</span>
     </div>
   </div>
-  <iframe class="viewer-frame" src="{first_path}"></iframe>
+  <div class="main">
+    <div class="sidebar">
+      <div class="sidebar-header">Archived Pages ({page_count})</div>
+      <div class="sidebar-list">
+        {pages_html}
+      </div>
+    </div>
+    <iframe class="viewer-frame" src="{first_path}"></iframe>
+  </div>
 </body>
 </html>
 """
@@ -328,10 +464,30 @@ VIEWER_HTML = """<!DOCTYPE html>
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if not WARC_PATH.exists():
-        log.error("%s not found. Run process.py first.", WARC_PATH)
+    parser = argparse.ArgumentParser(
+        description="Serve a WARC archive in a browser viewer.",
+    )
+    parser.add_argument(
+        "--warc", type=Path, default=DEFAULT_WARC,
+        help=f"Path to WARC file (default: {DEFAULT_WARC})",
+    )
+    parser.add_argument(
+        "--port", type=int, default=5001,
+        help="Port to listen on (default: 5001)",
+    )
+    args = parser.parse_args()
+
+    if not args.warc.exists():
+        log.error("%s not found. Run process.py or batch_capture.py first.", args.warc)
         raise SystemExit(1)
 
-    get_index()
-    log.info("Starting WARC viewer at http://localhost:5001/_viewer")
-    app.run(host="127.0.0.1", port=5001, debug=False)
+    warc_index = WarcIndex(args.warc)
+
+    def get_index_override() -> WarcIndex:
+        return warc_index
+
+    import viewer_server_warc as _self
+    _self.get_index = get_index_override
+
+    log.info("Starting WARC viewer at http://localhost:%d/_viewer", args.port)
+    app.run(host="127.0.0.1", port=args.port, debug=False)
